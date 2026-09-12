@@ -442,6 +442,14 @@ class Downloader(QThread):
                 self.stage.emit("获取流地址…")
                 data = api.playurl(bvid, cid, self.qn)
 
+                # 服务端实际提供哪些档位由片源决定，直接列出来，省得用户以为还能更高
+                aq = data.get("accept_quality") or []
+                if aq:
+                    best = max(aq)
+                    self.log.emit("  该视频可用清晰度：%s（最高 %s）" % (
+                        " / ".join(QUALITY_NAMES.get(q, str(q)) for q in aq),
+                        QUALITY_NAMES.get(best, str(best))))
+
                 dash = data.get("dash")
                 if dash:
                     vs = dash.get("video", [])
@@ -466,7 +474,9 @@ class Downloader(QThread):
                                           "不是程序的问题。" % name_low)
                             self.log.emit("  → 要 1080P：在「登录 Cookie」填 SESSDATA 后重下。")
                         else:
-                            self.log.emit("⚠ 只给到 %s（该清晰度可能需大会员或账号无权限）。" % name_low)
+                            self.log.emit("⚠ 只给到 %s —— 多数情况是**该片源本身没有更高档**"
+                                          "（UP 主没传），少数是需大会员。" % name_low)
+                            self.log.emit("  → 上限就是上面那句「最高 ○○」，下不到更高的了。")
 
                     vpath = os.path.join(outroot, ".%s.v.m4s" % num)
                     apath = os.path.join(outroot, ".%s.a.m4s" % num)
