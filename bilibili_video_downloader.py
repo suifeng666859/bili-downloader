@@ -25,11 +25,11 @@ import urllib.parse
 import requests
 
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QIcon, QFont
+from PySide6.QtGui import QIcon, QFont, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QComboBox, QTextEdit, QProgressBar,
-    QFileDialog, QMessageBox, QGroupBox, QCheckBox, QFrame
+    QFileDialog, QMessageBox, QGroupBox, QCheckBox, QFrame, QDialog
 )
 
 APP_TITLE = "B站视频下载器"
@@ -38,6 +38,8 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 API_VIEW = "https://api.bilibili.com/x/web-interface/view"
 API_PLAYURL = "https://api.bilibili.com/x/player/playurl"
+API_QR_GEN = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
+API_QR_POLL = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
 
 # qn -> 名称
 QUALITY_NAMES = {
@@ -126,6 +128,113 @@ def normalize_cookie(text):
     # 只有 SESSDATA 值
     t = re.sub(r"^\s*SESSDATA\s*=\s*", "", t, flags=re.I)
     return "SESSDATA=" + t.strip()
+
+
+class QrLogin(QThread):
+    """扫码登录：取二维码 -> 等用户扫 -> 拿到 SESSDATA。
+
+    走的是 B站官方 passport 接口，全程不碰浏览器 Cookie。
+    """
+    qr_ready = Signal(bytes)     # 二维码 PNG 字节
+    status = Signal(str)         # 状态文案
+    ok = Signal(str, str)        # 成功：(cookie 串, 用户名)
+    fail = Signal(str)           # 失败原因
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        import io
+        try:
+            import qrcode
+        except ImportError:
+            self.fail.emit("缺少 qrcode 库，请先运行：pip install qrcode pillow")
+            return
+
+        s = requests.Session()
+        s.headers.update({"User-Agent": UA, "Referer": "https://www.bilibili.com/"})
+
+        self.status.emit("正在获取二维码…")
+        try:
+            j = s.get(API_QR_GEN, timeout=20).json()
+        except Exception as e:
+            self.fail.emit("网络错误：%s" % e)
+            return
+        if j.get("code") != 0:
+            self.fail.emit("获取二维码失败：%s" % (j.get("message") or j.get("code")))
+            return
+
+        d = j["data"]
+        key = d["qrcode_key"]
+        try:
+            img = qrcode.make(d["url"])
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            self.qr_ready.emit(buf.getvalue())
+        except Exception as e:
+            self.fail.emit("生成二维码失败：%s" % e)
+            return
+
+        self.status.emit("请用手机 B站 App 扫码 → 再点「确认登录」")
+
+        last = None
+        deadline = time.time() + 180
+        while time.time() < deadline and not self._stop:
+            try:
+                rr = s.get(API_QR_POLL, params={"qrcode_key": key},
+                           timeout=20, allow_redirects=False)
+                jj = rr.json()
+                dd = jj.get("data") or {}
+                code = dd.get("code")
+                if code != last:
+                    last = code
+                    if code == 86101:
+                        self.status.emit("等待扫码…")
+                    elif code == 86090:
+                        self.status.emit("已扫码，请在手机上点「确认登录」")
+                    elif code == 86038:
+                        self.fail.emit("二维码已过期，请重新点「扫码登录」")
+                        return
+                if code == 0:
+                    sess = None
+                    for ck in rr.cookies:
+                        if ck.name == "SESSDATA":
+                            sess = ck.value
+                    if not sess:
+                        m = re.search(r"SESSDATA=([^;]+)",
+                                      rr.headers.get("Set-Cookie", ""))
+                        if m:
+                            sess = m.group(1)
+                    if sess:
+                        cookie = "SESSDATA=" + sess
+                        uname = ""
+                        try:
+                            nv = requests.Session()
+                            nv.headers.update({"User-Agent": UA,
+                                               "Referer": "https://www.bilibili.com/",
+                                               "Cookie": cookie})
+                            nd = nv.get("https://api.bilibili.com/x/web-interface/nav",
+                                        timeout=15).json().get("data") or {}
+                            if nd.get("isLogin"):
+                                uname = nd.get("uname") or ""
+                                if nd.get("vipStatus"):
+                                    uname += "（大会员）"
+                        except Exception:
+                            pass
+                        self.ok.emit(cookie, uname)
+                    else:
+                        self.fail.emit("登录成功，但没在响应里拿到 SESSDATA")
+                    return
+            except Exception:
+                pass
+            time.sleep(2)
+
+        if not self._stop:
+            self.fail.emit("超时，请重新点「扫码登录」")
 
 
 class BiliApi:
@@ -412,6 +521,69 @@ class Downloader(QThread):
                     pass
 
 
+class QrDialog(QDialog):
+    """显示二维码、等待扫码完成的模态小窗。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("扫码登录 B站")
+        self.setFixedSize(324, 420)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(10)
+
+        tip = QLabel("手机 B站 App →「扫一扫」")
+        tip.setAlignment(Qt.AlignCenter)
+        tip.setStyleSheet("font-weight:600;")
+        lay.addWidget(tip)
+
+        self.lbl_qr = QLabel("正在获取…")
+        self.lbl_qr.setAlignment(Qt.AlignCenter)
+        self.lbl_qr.setFixedSize(260, 260)
+        self.lbl_qr.setStyleSheet(
+            "border:1px solid #e0e0e0;border-radius:8px;color:#999;")
+        lay.addWidget(self.lbl_qr, 0, Qt.AlignCenter)
+
+        self.lbl_st = QLabel("")
+        self.lbl_st.setAlignment(Qt.AlignCenter)
+        self.lbl_st.setWordWrap(True)
+        self.lbl_st.setStyleSheet("color:#666;")
+        lay.addWidget(self.lbl_st)
+
+        self.cookie = None
+        self.uname = ""
+        self.th = QrLogin(self)
+        self.th.qr_ready.connect(self._on_qr)
+        self.th.status.connect(self.lbl_st.setText)
+        self.th.ok.connect(self._on_ok)
+        self.th.fail.connect(self._on_fail)
+        self.th.start()
+
+    def _on_qr(self, png):
+        pm = QPixmap()
+        pm.loadFromData(png)
+        if pm.isNull():
+            self.lbl_st.setText("二维码渲染失败")
+            return
+        self.lbl_qr.setPixmap(pm.scaled(248, 248, Qt.KeepAspectRatio,
+                                        Qt.FastTransformation))
+
+    def _on_ok(self, cookie, uname):
+        self.cookie = cookie
+        self.uname = uname
+        self.accept()
+
+    def _on_fail(self, msg):
+        self.lbl_st.setText("✗ " + msg)
+        self.lbl_qr.setText("×")
+
+    def closeEvent(self, e):
+        self.th.stop()
+        self.th.wait(3000)
+        super().closeEvent(e)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -472,10 +644,14 @@ class MainWindow(QMainWindow):
         grid.addWidget(QLabel("登录 Cookie"), 2, 0)
         self.inp_cookie = QLineEdit()
         self.inp_cookie.setEchoMode(QLineEdit.EchoMode.Password)
-        self.inp_cookie.setPlaceholderText(
-            "可选 —— 填了才能下 1080P。粘贴 SESSDATA 的值、或整条 Cookie 都可以")
-        grid.addWidget(self.inp_cookie, 2, 1, 1, 2)
-        btn_help = QPushButton("怎么获取？")
+        self.inp_cookie.setPlaceholderText("填了才能下 1080P；点右边「扫码登录」最省事")
+        grid.addWidget(self.inp_cookie, 2, 1)
+        btn_qr = QPushButton("扫码登录")
+        btn_qr.setFixedWidth(80)
+        btn_qr.setToolTip("用手机 B站 App 扫码，自动获取登录凭据")
+        btn_qr.clicked.connect(self.do_qr_login)
+        grid.addWidget(btn_qr, 2, 2)
+        btn_help = QPushButton("怎么填？")
         btn_help.setFixedWidth(80)
         btn_help.clicked.connect(self.show_cookie_help)
         grid.addWidget(btn_help, 2, 3)
@@ -551,13 +727,46 @@ class MainWindow(QMainWindow):
             if i >= 0:
                 self.cmb.setCurrentIndex(i)
 
+    def _save_prefs(self, outdir, qn, cookie):
+        """保存设置。
+
+        注意：必须**先读回已有配置再改**，不能新建 dict 整体覆盖 ——
+        否则任何一次「未填 Cookie 就点下载」都会把已保存的登录凭据抹掉。
+        """
+        prefs = load_config()
+        prefs["outdir"] = outdir
+        prefs["qn"] = qn
+        if self.chk_remember.isChecked():
+            if cookie:
+                prefs["cookie"] = cookie
+        else:
+            prefs.pop("cookie", None)      # 取消勾选 = 明确不要保存
+        save_config(prefs)
+
+    def do_qr_login(self):
+        dlg = QrDialog(self)
+        if dlg.exec() == QDialog.Accepted and dlg.cookie:
+            self.inp_cookie.setText(dlg.cookie)
+            prefs = load_config()
+            prefs["cookie"] = dlg.cookie
+            save_config(prefs)
+            self.chk_remember.setChecked(True)
+            extra = ("　账号：%s" % dlg.uname) if dlg.uname else ""
+            self.log("✔ 扫码登录成功，Cookie 已保存。%s" % extra)
+        else:
+            self.log("扫码登录未完成")
+
     def show_cookie_help(self):
-        QMessageBox.information(self, "怎么获取 SESSDATA", (
-            "1. 用浏览器（Edge / Chrome）打开 bilibili.com，确认已登录\n\n"
-            "2. 按 F12 打开开发者工具，顶部切到「应用程序 / Application」\n\n"
-            "3. 左侧 Cookies → 展开 https://www.bilibili.com\n\n"
-            "4. 找到名为 SESSDATA 的那一行，双击「值」列，全选复制\n\n"
-            "5. 粘贴到本窗口的「登录 Cookie」框（整条 Cookie 串也认）\n\n"
+        QMessageBox.information(self, "怎么获取登录凭据", (
+            "【推荐】直接点「扫码登录」按钮，用手机 B站 App 扫一下就行，不用管 Cookie。\n"
+            "——————————————————\n\n"
+            "手动填写（备选）：\n\n"
+            "1. 浏览器打开 bilibili.com，确认已登录\n\n"
+            "2. 按 F12 打开开发者工具\n\n"
+            "3. 顶部标签切到「存储 / Storage」（旧版叫「应用程序 / Application」）\n\n"
+            "4. 左侧展开 Cookies → https://www.bilibili.com\n\n"
+            "5. 找到名为 SESSDATA 的那一行，双击「值」列，全选复制\n\n"
+            "6. 粘贴到「登录 Cookie」框（只贴值、或整条 Cookie 串都认）\n\n"
             "说明：SESSDATA 等同于你的登录凭证，只留在本机；"
             "勾了「记住 Cookie」会写入\n%s\n"
             "不要把这个值发给别人，也别截图公开。") % CONFIG_PATH)
@@ -597,10 +806,7 @@ class MainWindow(QMainWindow):
         if qn >= 80 and not cookie:
             self.log("⚠ 未填 Cookie：B站未登录最高只发 480P，选 1080P 也会被降级。")
 
-        prefs = {"outdir": outdir, "qn": qn}
-        if cookie and self.chk_remember.isChecked():
-            prefs["cookie"] = cookie
-        save_config(prefs)
+        self._save_prefs(outdir, qn, cookie)
 
         self.worker = Downloader(link, qn, outdir, self.ffmpeg, cookie=cookie)
         self.worker.log.connect(self.log)
