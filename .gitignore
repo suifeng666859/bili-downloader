@@ -1,0 +1,23 @@
+# 字节码与缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 打包产物
+build/
+dist/
+*.spec
+
+# 下载产物
+bilibili/
+*.mp4
+*.flv
+*.m4s
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
