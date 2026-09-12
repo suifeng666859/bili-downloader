@@ -48,6 +48,27 @@ QUALITY_NAMES = {
 }
 
 
+# 配置存放位置（用户主目录，不会进仓库）
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".bili_downloader.json")
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
 def find_ffmpeg():
     """按优先级找 ffmpeg；找不到返回 None。"""
     hits = []
@@ -78,10 +99,42 @@ def sanitize(name):
     return name[:120] or "untitled"
 
 
+def normalize_cookie(text):
+    """把用户粘贴的内容规整成可用的 Cookie 串。
+
+    接受的输入：
+      1. 完整 Cookie 字符串（含 SESSDATA=xxx；...）
+      2. 只粘贴了 SESSDATA 的值
+      3. 复制时带上引号 / 换行 / 多余空格的脏数据
+    注意：SESSDATA 的值本身是 URL 编码的（含 %2C），不能 unquote。
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    t = t.strip('"').strip("'").strip()
+    # 整串被 URL 编码过的情况
+    if t[:10].upper().startswith("SESSDATA%3D"):
+        try:
+            t = urllib.parse.unquote(t)
+        except Exception:
+            pass
+    # 完整 cookie 串
+    if re.search(r"(^|;\s*)SESSDATA\s*=", t, re.I):
+        t = re.sub(r"[\r\n]+", " ", t)
+        parts = [p.strip() for p in t.split(";") if p.strip()]
+        return "; ".join(parts)
+    # 只有 SESSDATA 值
+    t = re.sub(r"^\s*SESSDATA\s*=\s*", "", t, flags=re.I)
+    return "SESSDATA=" + t.strip()
+
+
 class BiliApi:
-    def __init__(self):
+    def __init__(self, cookie=""):
+        self.cookie = normalize_cookie(cookie)
         self.s = requests.Session()
         self.s.headers.update({"User-Agent": UA, "Referer": "https://www.bilibili.com/"})
+        if self.cookie:
+            self.s.headers.update({"Cookie": self.cookie})
 
     # ---------- 解析用户输入 ----------
     @staticmethod
@@ -144,7 +197,8 @@ class Downloader(QThread):
     stage = Signal(str)
     done = Signal(bool, str)
 
-    def __init__(self, link, qn, outdir, ffmpeg, prefer=None, only_audio=False, parent=None):
+    def __init__(self, link, qn, outdir, ffmpeg, prefer=None, only_audio=False,
+                 cookie="", parent=None):
         super().__init__(parent)
         self.link = link
         self.qn = qn
@@ -152,6 +206,7 @@ class Downloader(QThread):
         self.ffmpeg = ffmpeg
         self.prefer = prefer or ["hev1", "avc1"]   # 编码偏好
         self.only_audio = only_audio
+        self.cookie = normalize_cookie(cookie)     # 登录态，空串=未登录
         self._stop = False
 
     def stop(self):
@@ -160,6 +215,8 @@ class Downloader(QThread):
     # ---------- 内部工具 ----------
     def _download(self, url, path, start_pct, end_pct, label):
         headers = {"User-Agent": UA, "Referer": "https://www.bilibili.com/"}
+        if self.cookie:
+            headers["Cookie"] = self.cookie
         with self.s_get(url, headers, stream=True) as r:
             r.raise_for_status()
             total = int(r.headers.get("Content-Length") or 0)
@@ -210,7 +267,7 @@ class Downloader(QThread):
     def run(self):
         tmpfiles = []
         try:
-            api = BiliApi()
+            api = BiliApi(self.cookie)
             kind, value, page = api.parse_input(self.link)
             if kind == "short":
                 self.stage.emit("解析短链…")
@@ -233,6 +290,9 @@ class Downloader(QThread):
             multi = len(targets) > 1
             self.log.emit("视频：%s" % info["title"])
             self.log.emit("BV号：%s   共 %d 集" % (bvid, len(pages)))
+            self.log.emit("登录态：%s" % ("✔ 已填 Cookie，可获取高清晰度"
+                                          if self.cookie else
+                                          "✘ 未填 Cookie —— 最高只能拿 480P"))
 
             outroot = os.path.join(self.outdir, title)
             os.makedirs(outroot, exist_ok=True)
@@ -271,9 +331,18 @@ class Downloader(QThread):
                         if chosen:
                             break
                     chosen = chosen or pool[0]
-                    self.log.emit("画质：%s  %sx%s  %s" % (
+                    self.log.emit("画质：%s  %sx%s  %s  码率 %s kbps" % (
                         QUALITY_NAMES.get(chosen["id"], str(chosen["id"])),
-                        chosen["width"], chosen["height"], chosen["codecs"]))
+                        chosen["width"], chosen["height"], chosen["codecs"],
+                        int((chosen.get("bandwidth") or 0) / 1000)))
+                    if chosen["id"] < self.qn:
+                        name_low = QUALITY_NAMES.get(chosen["id"], str(chosen["id"]))
+                        if not self.cookie:
+                            self.log.emit("⚠ 只给到 %s：未登录时 B站服务端最高只发 480P，"
+                                          "不是程序的问题。" % name_low)
+                            self.log.emit("  → 要 1080P：在「登录 Cookie」填 SESSDATA 后重下。")
+                        else:
+                            self.log.emit("⚠ 只给到 %s（该清晰度可能需大会员或账号无权限）。" % name_low)
 
                     vpath = os.path.join(outroot, ".%s.v.m4s" % num)
                     apath = os.path.join(outroot, ".%s.a.m4s" % num)
@@ -351,10 +420,13 @@ class MainWindow(QMainWindow):
         self.ffmpeg = find_ffmpeg()
         self.worker = None
         self._build_ui()
+        self._load_prefs()
         if not self.ffmpeg:
             self.log("⚠ 未找到 ffmpeg，无法合流。请把 ffmpeg.exe 放到程序同目录或加入 PATH。")
         else:
             self.log("✔ ffmpeg：%s" % self.ffmpeg)
+        if normalize_cookie(self.inp_cookie.text()):
+            self.log("✔ 已载入上次保存的 Cookie")
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -397,17 +469,33 @@ class MainWindow(QMainWindow):
             self.cmb.addItem(name, qn)
         grid.addWidget(self.cmb, 1, 1)
 
-        grid.addWidget(QLabel("保存到"), 2, 0)
+        grid.addWidget(QLabel("登录 Cookie"), 2, 0)
+        self.inp_cookie = QLineEdit()
+        self.inp_cookie.setEchoMode(QLineEdit.EchoMode.Password)
+        self.inp_cookie.setPlaceholderText(
+            "可选 —— 填了才能下 1080P。粘贴 SESSDATA 的值、或整条 Cookie 都可以")
+        grid.addWidget(self.inp_cookie, 2, 1, 1, 2)
+        btn_help = QPushButton("怎么获取？")
+        btn_help.setFixedWidth(80)
+        btn_help.clicked.connect(self.show_cookie_help)
+        grid.addWidget(btn_help, 2, 3)
+
+        grid.addWidget(QLabel("保存到"), 3, 0)
         self.outdir = QLineEdit(os.path.join(os.path.expanduser("~"), "Videos", "bilibili"))
-        grid.addWidget(self.outdir, 2, 1, 1, 2)
+        grid.addWidget(self.outdir, 3, 1, 1, 2)
         btn_dir = QPushButton("选择…")
         btn_dir.setFixedWidth(80)
         btn_dir.clicked.connect(self.choose_dir)
-        grid.addWidget(btn_dir, 2, 3)
+        grid.addWidget(btn_dir, 3, 3)
 
         self.chk_open = QCheckBox("完成后打开文件夹")
         self.chk_open.setChecked(True)
-        grid.addWidget(self.chk_open, 3, 1)
+        grid.addWidget(self.chk_open, 4, 1)
+
+        self.chk_remember = QCheckBox("记住 Cookie")
+        self.chk_remember.setChecked(True)
+        self.chk_remember.setToolTip("存到 %s（仅本机，不会进仓库）" % CONFIG_PATH)
+        grid.addWidget(self.chk_remember, 4, 2, 1, 2)
 
         lay.addWidget(box)
 
@@ -452,6 +540,28 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.box, 1)
 
     # ---------- 行为 ----------
+    def _load_prefs(self):
+        cfg = load_config()
+        if cfg.get("cookie"):
+            self.inp_cookie.setText(cfg["cookie"])
+        if cfg.get("outdir"):
+            self.outdir.setText(cfg["outdir"])
+        if isinstance(cfg.get("qn"), int):
+            i = self.cmb.findData(cfg["qn"])
+            if i >= 0:
+                self.cmb.setCurrentIndex(i)
+
+    def show_cookie_help(self):
+        QMessageBox.information(self, "怎么获取 SESSDATA", (
+            "1. 用浏览器（Edge / Chrome）打开 bilibili.com，确认已登录\n\n"
+            "2. 按 F12 打开开发者工具，顶部切到「应用程序 / Application」\n\n"
+            "3. 左侧 Cookies → 展开 https://www.bilibili.com\n\n"
+            "4. 找到名为 SESSDATA 的那一行，双击「值」列，全选复制\n\n"
+            "5. 粘贴到本窗口的「登录 Cookie」框（整条 Cookie 串也认）\n\n"
+            "说明：SESSDATA 等同于你的登录凭证，只留在本机；"
+            "勾了「记住 Cookie」会写入\n%s\n"
+            "不要把这个值发给别人，也别截图公开。") % CONFIG_PATH)
+
     def log(self, s):
         self.box.append(s)
         self.box.verticalScrollBar().setValue(self.box.verticalScrollBar().maximum())
@@ -483,7 +593,16 @@ class MainWindow(QMainWindow):
         self.box.clear()
 
         qn = self.cmb.currentData()
-        self.worker = Downloader(link, qn, outdir, self.ffmpeg)
+        cookie = normalize_cookie(self.inp_cookie.text())
+        if qn >= 80 and not cookie:
+            self.log("⚠ 未填 Cookie：B站未登录最高只发 480P，选 1080P 也会被降级。")
+
+        prefs = {"outdir": outdir, "qn": qn}
+        if cookie and self.chk_remember.isChecked():
+            prefs["cookie"] = cookie
+        save_config(prefs)
+
+        self.worker = Downloader(link, qn, outdir, self.ffmpeg, cookie=cookie)
         self.worker.log.connect(self.log)
         self.worker.progress.connect(self.bar.setValue)
         self.worker.stage.connect(self.stage_lbl.setText)
