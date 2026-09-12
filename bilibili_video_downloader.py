@@ -130,6 +130,27 @@ def normalize_cookie(text):
     return "SESSDATA=" + t.strip()
 
 
+def pick_video_stream(vs, qn, prefer=None):
+    """从 DASH 视频流列表里挑一条，返回 (选中流, 同清晰度的候选池)。
+
+    规则：
+      1. 先取「不超过 qn 的最高清晰度」那一档；
+      2. 同一档内 B站可能同时给 avc1 / hev1 / av01 三份独立转码，码率差很多
+         （实测同档 avc1 1788 kbps，hev1 仅 589 kbps）。
+         默认按**码率最高**取 —— 这才是最接近网页端播放的画质；
+         传了 prefer（如 ["avc1","av01"]）才按编码优先级挑。
+    """
+    cand = [v for v in vs if v["id"] <= qn] or vs
+    best_id = max(v["id"] for v in cand)
+    pool = [v for v in cand if v["id"] == best_id]
+    if prefer:
+        for codec in prefer:
+            for v in pool:
+                if v["codecs"].startswith(codec):
+                    return v, pool
+    return max(pool, key=lambda v: v.get("bandwidth") or 0), pool
+
+
 class QrLogin(QThread):
     """扫码登录：取二维码 -> 等用户扫 -> 拿到 SESSDATA。
 
@@ -313,7 +334,8 @@ class Downloader(QThread):
         self.qn = qn
         self.outdir = outdir
         self.ffmpeg = ffmpeg
-        self.prefer = prefer or ["hev1", "avc1"]   # 编码偏好
+        # 编码偏好；None / 空列表 = 同一清晰度里按**码率最高**取（推荐）
+        self.prefer = prefer
         self.only_audio = only_audio
         self.cookie = normalize_cookie(cookie)     # 登录态，空串=未登录
         self._stop = False
@@ -426,24 +448,17 @@ class Downloader(QThread):
                     aus = dash.get("audio") or []
                     if not vs:
                         raise RuntimeError("没有可用的视频流")
-                    # 优先选不超过请求清晰度的最高档
-                    cand = [v for v in vs if v["id"] <= self.qn] or vs
-                    best_id = max(v["id"] for v in cand)
-                    pool = [v for v in cand if v["id"] == best_id]
-                    # 编码偏好
-                    chosen = None
-                    for codec in self.prefer:
-                        for v in pool:
-                            if v["codecs"].startswith(codec):
-                                chosen = v
-                                break
-                        if chosen:
-                            break
-                    chosen = chosen or pool[0]
+                    # 见模块上方 pick_video_stream()：默认取同清晰度里码率最高的那份转码
+                    chosen, pool = pick_video_stream(vs, self.qn, self.prefer)
+
+                    kb = lambda v: int((v.get("bandwidth") or 0) / 1000)
                     self.log.emit("画质：%s  %sx%s  %s  码率 %s kbps" % (
                         QUALITY_NAMES.get(chosen["id"], str(chosen["id"])),
-                        chosen["width"], chosen["height"], chosen["codecs"],
-                        int((chosen.get("bandwidth") or 0) / 1000)))
+                        chosen["width"], chosen["height"], chosen["codecs"], kb(chosen)))
+                    if len(pool) > 1:
+                        alt = "  ".join("%s %dkbps" % (v["codecs"].split(".")[0], kb(v))
+                                        for v in sorted(pool, key=lambda x: -(x.get("bandwidth") or 0)))
+                        self.log.emit("  同档可选编码：%s（已选最高）" % alt)
                     if chosen["id"] < self.qn:
                         name_low = QUALITY_NAMES.get(chosen["id"], str(chosen["id"]))
                         if not self.cookie:
